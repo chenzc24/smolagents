@@ -402,28 +402,79 @@ class GradioUI:
             session_state["agent"] = self.agent
 
         try:
+            # thinking_value accumulates simplified / structured thinking content
+            thinking_value = ""
+
             messages.append(gr.ChatMessage(role="user", content=prompt, metadata={"status": "done"}))
-            yield messages
+            # initialize pause/buffer flags in session state
+            session_state.setdefault("stream_paused", False)
+            session_state.setdefault("stream_buffer", [])
+
+            # yield both chatbot messages and thinking content
+            yield messages, thinking_value
 
             for msg in stream_to_gradio(
                 session_state["agent"], task=prompt, reset_agent_memory=self.reset_agent_memory
             ):
                 if isinstance(msg, gr.ChatMessage):
+                    # If paused, buffer the message and continue (no UI update)
+                    if session_state.get("stream_paused", False):
+                        buf = session_state.get("stream_buffer", []) or []
+                        buf.append(msg)
+                        session_state["stream_buffer"] = buf
+                        # Do not append to messages now; just yield current state
+                        yield messages, thinking_value
+                        continue
+
                     messages[-1].metadata["status"] = "done"
                     messages.append(msg)
+                    # Extract thinking-relevant pieces:
+                    try:
+                        meta = msg.metadata or {}
+                    except Exception:
+                        meta = {}
+                    # Normalize content to string when possible
+                    content_str = None
+                    if isinstance(msg.content, str):
+                        content_str = msg.content.strip()
+
+                    # 1) Step summary detection: e.g. "**Step 1 — Summary:** ..."
+                    import re as _re
+
+                    if content_str and _re.match(r"\*\*Step \d+ — Summary:.*", content_str):
+                        m = _re.match(r"\*\*(Step \d+) — Summary:\*\*\s*(.*)", content_str)
+                        if m:
+                            step_name = m.group(1)
+                            summary_text = m.group(2)
+                            thinking_value += f"- **{step_name}**: {summary_text}\n"
+                    # 2) Planning step header
+                    elif content_str and content_str.startswith("**Planning step**"):
+                        # include next line or the content as planning brief
+                        plan_brief = content_str.replace("**Planning step**", "").strip()
+                        thinking_value += f"- **Planning**: {plan_brief}\n"
+                    # 3) Collapsible details or explicit thinking sections -> append as expanded markdown/html
+                    elif meta.get("collapsible") or (content_str and ("<details>" in content_str or "Thinking (expand)" in content_str or content_str.startswith("###"))):
+                        thinking_value = thinking_value + "\n\n" + str(msg.content)
                 elif isinstance(msg, str):  # Then it's only a completion delta
                     msg = msg.replace("<", r"\<").replace(">", r"\>")  # HTML tags seem to break Gradio Chatbot
-                    if messages[-1].metadata["status"] == "pending":
+                    if messages[-1].metadata.get("status") == "pending":
                         messages[-1].content = msg
                     else:
                         messages.append(
                             gr.ChatMessage(role=MessageRole.ASSISTANT, content=msg, metadata={"status": "pending"})
                         )
-                yield messages
+                # Always yield both outputs so the UI updates both sides
+                yield messages, thinking_value
 
-            yield messages
+            # final yield
+            yield messages, thinking_value
         except Exception as e:
-            yield messages
+            # On error, still return current messages and thinking content
+            try:
+                return_val = (messages, thinking_value)
+            except Exception:
+                return_val = (messages, "")
+            yield return_val
             raise gr.Error(f"Error in interaction: {str(e)}")
 
     def upload_file(self, file, file_uploads_log, allowed_file_types=None):
@@ -563,30 +614,73 @@ class GradioUI:
                     "<br><br><h4><center>Powered by <a target='_blank' href='https://github.com/huggingface/smolagents'><b>smolagents</b></a></center></h4>"
                 )
 
-            # Main chat interface
-            chatbot = gr.Chatbot(
-                label="Agent",
-                type="messages",
-                avatar_images=(
-                    None,
-                    "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/smolagents/mascot_smol.png",
-                ),
-                resizeable=True,
-                scale=1,
-                latex_delimiters=[
-                    {"left": r"$$", "right": r"$$", "display": True},
-                    {"left": r"$", "right": r"$", "display": False},
-                    {"left": r"\[", "right": r"\]", "display": True},
-                    {"left": r"\(", "right": r"\)", "display": False},
-                ],
-            )
+            # Main chat interface - split into two columns: left=streaming/chat, right=thinking steps
+            with gr.Row():
+                with gr.Column(scale=3):
+                    chatbot = gr.Chatbot(
+                        label="Agent",
+                        type="messages",
+                        avatar_images=(
+                            None,
+                            "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/smolagents/mascot_smol.png",
+                        ),
+                        resizeable=True,
+                        scale=1,
+                        latex_delimiters=[
+                            {"left": r"$$", "right": r"$$", "display": True},
+                            {"left": r"$", "right": r"$", "display": False},
+                            {"left": r"\\[", "right": r"\\]", "display": True},
+                            {"left": r"\\(", "right": r"\\)", "display": False},
+                        ],
+                    )
+                with gr.Column(scale=1):
+                    # Controls for left/chat column and right/thinking column
+                    with gr.Row():
+                        clear_btn = gr.Button("Clear Chat", variant="secondary")
+                        pause_btn = gr.Button("Pause Stream", variant="secondary")
+                        copy_thinking_btn = gr.Button("Copy Thinking", variant="secondary")
+                    thinking_md = gr.Markdown(value="No thinking yet.", label="Thinking")
+                    # hidden box to populate when copying thinking content so user can easily copy text
+                    thinking_copy_box = gr.Textbox(value="", visible=False)
+
+                    # Wire simple control callbacks
+                    def _clear_chat(stored_messages):
+                        # Clear chat messages and reset stored_messages state
+                        return gr.update(value=[]), []
+
+                    def _toggle_pause(session_state, stored_messages):
+                        # Toggle paused state; when resuming, flush buffered messages
+                        paused = session_state.get("stream_paused", False)
+                        if paused:
+                            # currently paused -> resume
+                            buf = session_state.get("stream_buffer", []) or []
+                            # append buffered chat messages to stored_messages
+                            new_msgs = list(stored_messages) if stored_messages else []
+                            new_msgs.extend(buf)
+                            # clear buffer and paused flag
+                            session_state["stream_buffer"] = []
+                            session_state["stream_paused"] = False
+                            return gr.update(value=new_msgs), new_msgs
+                        else:
+                            # pause: set flag
+                            session_state["stream_paused"] = True
+                            session_state.setdefault("stream_buffer", [])
+                            return gr.update(value=stored_messages), stored_messages
+
+                    def _copy_thinking(thinking_value):
+                        # Put thinking content into a textbox for easy copying
+                        return gr.update(value=thinking_value, visible=True)
+
+                    clear_btn.click(_clear_chat, [stored_messages], [chatbot, stored_messages])
+                    pause_btn.click(_toggle_pause, [session_state, stored_messages], [chatbot, stored_messages])
+                    copy_thinking_btn.click(_copy_thinking, [thinking_md], [thinking_copy_box])
 
             # Set up event handlers
             text_input.submit(
                 self.log_user_message,
                 [text_input, file_uploads_log],
                 [stored_messages, text_input, submit_btn],
-            ).then(self.interact_with_agent, [stored_messages, chatbot, session_state], [chatbot]).then(
+            ).then(self.interact_with_agent, [stored_messages, chatbot, session_state], [chatbot, thinking_md]).then(
                 lambda: (
                     gr.Textbox(
                         interactive=True, placeholder="Enter your prompt here and press Shift+Enter or the button"
@@ -601,7 +695,7 @@ class GradioUI:
                 self.log_user_message,
                 [text_input, file_uploads_log],
                 [stored_messages, text_input, submit_btn],
-            ).then(self.interact_with_agent, [stored_messages, chatbot, session_state], [chatbot]).then(
+            ).then(self.interact_with_agent, [stored_messages, chatbot, session_state], [chatbot, thinking_md]).then(
                 lambda: (
                     gr.Textbox(
                         interactive=True, placeholder="Enter your prompt here and press Shift+Enter or the button"
