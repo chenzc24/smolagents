@@ -90,42 +90,55 @@ def _process_action_step(step_log: ActionStep, skip_model_outputs: bool = False)
     """
     import gradio as gr
 
-    # Output the step number
+    # Prepare step identifiers
     step_number = f"Step {step_log.step_number}"
-    if not skip_model_outputs:
-        yield gr.ChatMessage(role=MessageRole.ASSISTANT, content=f"**{step_number}**", metadata={"status": "done"})
 
-    # First yield the thought/reasoning from the LLM
-    if not skip_model_outputs and getattr(step_log, "model_output", ""):
+    # Create a concise summary for the step to show in the main chat
+    def _summarize_step(sl: ActionStep) -> str:
+        # Prefer a short, human-friendly summary
+        if getattr(sl, "tool_calls", []):
+            first_tool = sl.tool_calls[0]
+            return f"Executed tool: {first_tool.name}"
+        if getattr(sl, "model_output", ""):
+            text = _clean_model_output(sl.model_output)
+            # take first non-empty line and limit length
+            first_line = next((ln for ln in (l.strip() for l in text.splitlines()) if ln), "")
+            return (first_line[:200] + "...") if len(first_line) > 200 else first_line
+        if getattr(sl, "observations", ""):
+            obs = sl.observations.strip().splitlines()
+            return (obs[0][:200] + "...") if obs else "Execution logs available"
+        return "Step completed"
+
+    summary = _summarize_step(step_log)
+    # Emit a compact summary message for the main chat
+    yield gr.ChatMessage(role=MessageRole.ASSISTANT, content=f"**{step_number} — Summary:** {summary}", metadata={"status": "done"})
+
+    # If there is detailed model output / tool arguments / logs, place them inside a collapsible thinking box
+    thinking_parts: list[str] = []
+    if getattr(step_log, "model_output", ""):
         model_output = _clean_model_output(step_log.model_output)
-        yield gr.ChatMessage(role=MessageRole.ASSISTANT, content=model_output, metadata={"status": "done"})
+        thinking_parts.append("### Model output\n" + model_output)
 
-    # For tool calls, create a parent message
     if getattr(step_log, "tool_calls", []):
-        first_tool_call = step_log.tool_calls[0]
-        used_code = first_tool_call.name == "python_interpreter"
+        for tc in step_log.tool_calls:
+            args = tc.arguments
+            if isinstance(args, dict):
+                arg_text = str(args)
+            else:
+                arg_text = str(args)
+            thinking_parts.append(f"### Tool call: {tc.name}\n````\n{arg_text}\n````")
 
-        # Process arguments based on type
-        args = first_tool_call.arguments
-        if isinstance(args, dict):
-            content = str(args.get("answer", str(args)))
-        else:
-            content = str(args).strip()
+    if getattr(step_log, "observations", "") and step_log.observations.strip():
+        log_content = step_log.observations.strip()
+        log_content = re.sub(r"^Execution logs:\s*", "", log_content)
+        thinking_parts.append("### Execution logs\n" + log_content)
 
-        # Format code content if needed
-        if used_code:
-            content = _format_code_content(content)
-
-        # Create the tool call message
-        parent_message_tool = gr.ChatMessage(
-            role=MessageRole.ASSISTANT,
-            content=content,
-            metadata={
-                "title": f"🛠️ Used tool {first_tool_call.name}",
-                "status": "done",
-            },
-        )
-        yield parent_message_tool
+    if thinking_parts:
+        # Join parts and wrap in HTML <details> to make collapsible in the chat UI
+        details_body = "\n\n".join(thinking_parts)
+        # Use Markdown with HTML details tag for a collapsible block
+        details_html = f"<details><summary><b>Thinking (expand)</b></summary>\n\n{details_body}\n\n</details>"
+        yield gr.ChatMessage(role=MessageRole.ASSISTANT, content=details_html, metadata={"status": "done", "collapsible": True})
 
     # Display execution logs if they exist
     if getattr(step_log, "observations", "") and step_log.observations.strip():
@@ -307,7 +320,14 @@ class GradioUI:
         ```
     """
 
-    def __init__(self, agent: MultiStepAgent, file_upload_folder: str | None = None, reset_agent_memory: bool = False):
+    def __init__(
+        self,
+        agent: MultiStepAgent,
+        file_upload_folder: str | None = None,
+        reset_agent_memory: bool = False,
+        allowed_file_types: list[str] | None = None,
+        output_base_folders: list[str] | None = None,
+    ):
         if not _is_package_available("gradio"):
             raise ModuleNotFoundError(
                 "Please install 'gradio' extra to use the GradioUI: `pip install 'smolagents[gradio]'`"
@@ -317,9 +337,62 @@ class GradioUI:
         self.reset_agent_memory = reset_agent_memory
         self.name = getattr(agent, "name") or "Agent interface"
         self.description = getattr(agent, "description", None)
+        # Upload behavior
+        self.allowed_file_types = allowed_file_types
+        # Output folders to scan for generated files (support both 'output' and 'outputs' by default)
+        if output_base_folders is None:
+            output_base_folders = ["output", "outputs"]
+        # Keep only existing or potential paths (don't create them)
+        self.output_base_folders = [Path(p) for p in output_base_folders]
         if self.file_upload_folder is not None:
             if not self.file_upload_folder.exists():
                 self.file_upload_folder.mkdir(parents=True, exist_ok=True)
+
+    # --------------------
+    # Output files helpers
+    # --------------------
+    def _find_latest_output_dir(self) -> Path | None:
+        """Find the latest date-named output directory under configured base folders.
+
+        Priority:
+        1) Folders whose name matches YYYYMMDD_HHMMSS or YYYYMMDD-HHMMSS are ranked by name (lexicographic)
+        2) Otherwise, pick the most recently modified subfolder
+        """
+        candidates: list[Path] = []
+        for base in self.output_base_folders:
+            if base.exists() and base.is_dir():
+                for child in base.iterdir():
+                    if child.is_dir():
+                        candidates.append(child)
+        if not candidates:
+            return None
+
+        # Prefer date-named folders
+        date_re = re.compile(r"^\d{8}[-_]\d{6}$")
+        date_named = [c for c in candidates if date_re.match(c.name)]
+        if date_named:
+            return sorted(date_named, key=lambda p: p.name)[-1]
+        # Fallback: latest by mtime
+        return sorted(candidates, key=lambda p: p.stat().st_mtime)[-1]
+
+    def _list_files_in_dir(self, directory: Path, recursive: bool = True, max_files: int = 500) -> list[str]:
+        files: list[str] = []
+        try:
+            if recursive:
+                for root, _dirs, filenames in os.walk(directory):
+                    for fn in filenames:
+                        files.append(str(Path(root) / fn))
+                        if len(files) >= max_files:
+                            return files
+            else:
+                for child in directory.iterdir():
+                    if child.is_file():
+                        files.append(str(child))
+                        if len(files) >= max_files:
+                            return files
+        except Exception:
+            pass
+        return files
 
     def interact_with_agent(self, prompt, messages, session_state):
         import gradio as gr
@@ -371,7 +444,8 @@ class GradioUI:
             return gr.Textbox(value="No file uploaded", visible=True), file_uploads_log
 
         if allowed_file_types is None:
-            allowed_file_types = [".pdf", ".docx", ".txt"]
+            # Allow per-instance override if provided at init, otherwise default conservative set
+            allowed_file_types = self.allowed_file_types or [".pdf", ".docx", ".txt"]
 
         file_ext = os.path.splitext(file.name)[1].lower()
         if file_ext not in allowed_file_types:
@@ -448,6 +522,42 @@ class GradioUI:
                         [upload_file, file_uploads_log],
                         [upload_status, file_uploads_log],
                     )
+
+                # Output files viewer (latest date-named folder under output/ or outputs/)
+                with gr.Group():
+                    gr.Markdown("**Latest outputs**", container=True)
+                    latest_dir_md = gr.Markdown("No output folder found yet.")
+                    output_files_dropdown = gr.Dropdown(choices=[], label="Files in latest output", interactive=True)
+                    download_selected_btn = gr.DownloadButton(
+                        label="Download selected file",
+                        value=None,
+                        variant="secondary",
+                    )
+                    refresh_btn = gr.Button("Refresh outputs", variant="secondary")
+
+                    def _refresh_outputs():
+                        latest = self._find_latest_output_dir()
+                        if latest is None:
+                            return (
+                                gr.update(value="No output folder found yet."),
+                                gr.update(choices=[], value=None),
+                                gr.update(value=None),
+                            )
+                        files = self._list_files_in_dir(latest)
+                        pretty = f"Latest output directory: {latest} (files: {len(files)})"
+                        first = files[0] if files else None
+                        return (
+                            gr.update(value=pretty),
+                            gr.update(choices=files, value=first),
+                            gr.update(value=first),
+                        )
+
+                    def _select_output_file(selected):
+                        return gr.update(value=selected)
+
+                    # Wire events
+                    refresh_btn.click(_refresh_outputs, None, [latest_dir_md, output_files_dropdown, download_selected_btn])
+                    output_files_dropdown.change(_select_output_file, [output_files_dropdown], [download_selected_btn])
 
                 gr.HTML(
                     "<br><br><h4><center>Powered by <a target='_blank' href='https://github.com/huggingface/smolagents'><b>smolagents</b></a></center></h4>"
