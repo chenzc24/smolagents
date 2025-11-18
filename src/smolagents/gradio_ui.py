@@ -90,55 +90,42 @@ def _process_action_step(step_log: ActionStep, skip_model_outputs: bool = False)
     """
     import gradio as gr
 
-    # Prepare step identifiers
+    # Output the step number
     step_number = f"Step {step_log.step_number}"
+    if not skip_model_outputs:
+        yield gr.ChatMessage(role=MessageRole.ASSISTANT, content=f"**{step_number}**", metadata={"status": "done"})
 
-    # Create a concise summary for the step to show in the main chat
-    def _summarize_step(sl: ActionStep) -> str:
-        # Prefer a short, human-friendly summary
-        if getattr(sl, "tool_calls", []):
-            first_tool = sl.tool_calls[0]
-            return f"Executed tool: {first_tool.name}"
-        if getattr(sl, "model_output", ""):
-            text = _clean_model_output(sl.model_output)
-            # take first non-empty line and limit length
-            first_line = next((ln for ln in (l.strip() for l in text.splitlines()) if ln), "")
-            return (first_line[:200] + "...") if len(first_line) > 200 else first_line
-        if getattr(sl, "observations", ""):
-            obs = sl.observations.strip().splitlines()
-            return (obs[0][:200] + "...") if obs else "Execution logs available"
-        return "Step completed"
-
-    summary = _summarize_step(step_log)
-    # Emit a compact summary message for the main chat
-    yield gr.ChatMessage(role=MessageRole.ASSISTANT, content=f"**{step_number} — Summary:** {summary}", metadata={"status": "done"})
-
-    # If there is detailed model output / tool arguments / logs, place them inside a collapsible thinking box
-    thinking_parts: list[str] = []
-    if getattr(step_log, "model_output", ""):
+    # First yield the thought/reasoning from the LLM
+    if not skip_model_outputs and getattr(step_log, "model_output", ""):
         model_output = _clean_model_output(step_log.model_output)
-        thinking_parts.append("### Model output\n" + model_output)
+        yield gr.ChatMessage(role=MessageRole.ASSISTANT, content=model_output, metadata={"status": "done"})
 
+    # For tool calls, create a parent message
     if getattr(step_log, "tool_calls", []):
-        for tc in step_log.tool_calls:
-            args = tc.arguments
-            if isinstance(args, dict):
-                arg_text = str(args)
-            else:
-                arg_text = str(args)
-            thinking_parts.append(f"### Tool call: {tc.name}\n````\n{arg_text}\n````")
+        first_tool_call = step_log.tool_calls[0]
+        used_code = first_tool_call.name == "python_interpreter"
 
-    if getattr(step_log, "observations", "") and step_log.observations.strip():
-        log_content = step_log.observations.strip()
-        log_content = re.sub(r"^Execution logs:\s*", "", log_content)
-        thinking_parts.append("### Execution logs\n" + log_content)
+        # Process arguments based on type
+        args = first_tool_call.arguments
+        if isinstance(args, dict):
+            content = str(args.get("answer", str(args)))
+        else:
+            content = str(args).strip()
 
-    if thinking_parts:
-        # Join parts and wrap in HTML <details> to make collapsible in the chat UI
-        details_body = "\n\n".join(thinking_parts)
-        # Use Markdown with HTML details tag for a collapsible block
-        details_html = f"<details><summary><b>Thinking (expand)</b></summary>\n\n{details_body}\n\n</details>"
-        yield gr.ChatMessage(role=MessageRole.ASSISTANT, content=details_html, metadata={"status": "done", "collapsible": True})
+        # Format code content if needed
+        if used_code:
+            content = _format_code_content(content)
+
+        # Create the tool call message
+        parent_message_tool = gr.ChatMessage(
+            role=MessageRole.ASSISTANT,
+            content=content,
+            metadata={
+                "title": f"🛠️ Used tool {first_tool_call.name}",
+                "status": "done",
+            },
+        )
+        yield parent_message_tool
 
     # Display execution logs if they exist
     if getattr(step_log, "observations", "") and step_log.observations.strip():
@@ -302,9 +289,11 @@ class GradioUI:
     Args:
         agent ([`MultiStepAgent`]): The agent to interact with.
         file_upload_folder (`str`, *optional*): The folder where uploaded files will be saved.
-            If not provided, file uploads are disabled.
+            If not provided, inline uploads are disabled.
         reset_agent_memory (`bool`, *optional*, defaults to `False`): Whether to reset the agent's memory at the start of each interaction.
             If `True`, the agent will not remember previous interactions.
+        allowed_file_types (`list[str]`, *optional*): Allowed file extensions for inline uploads. Defaults to `[".pdf", ".docx", ".txt"]`.
+        output_base_folders (`list[str]`, *optional*): Local folders that should be initialized alongside the upload folder. Useful for surfacing generated outputs.
 
     Raises:
         ModuleNotFoundError: If the `gradio` extra is not installed.
@@ -337,62 +326,92 @@ class GradioUI:
         self.reset_agent_memory = reset_agent_memory
         self.name = getattr(agent, "name") or "Agent interface"
         self.description = getattr(agent, "description", None)
-        # Upload behavior
-        self.allowed_file_types = allowed_file_types
-        # Output folders to scan for generated files (support both 'output' and 'outputs' by default)
-        if output_base_folders is None:
-            output_base_folders = ["output", "outputs"]
-        # Keep only existing or potential paths (don't create them)
-        self.output_base_folders = [Path(p) for p in output_base_folders]
+        self.allowed_file_types = (
+            [ft.lower() if ft.startswith(".") else f".{ft.lower().lstrip('.')}" for ft in allowed_file_types]
+            if allowed_file_types
+            else [".pdf", ".docx", ".txt"]
+        )
+        self.output_base_folders = [Path(folder) for folder in (output_base_folders or [])]
+
         if self.file_upload_folder is not None:
             if not self.file_upload_folder.exists():
                 self.file_upload_folder.mkdir(parents=True, exist_ok=True)
+        for folder in self.output_base_folders:
+            folder.mkdir(parents=True, exist_ok=True)
 
-    # --------------------
-    # Output files helpers
-    # --------------------
-    def _find_latest_output_dir(self) -> Path | None:
-        """Find the latest date-named output directory under configured base folders.
+    def _sanitize_filename(self, filename: str) -> str:
+        sanitized_name = re.sub(r"[^\w\-.]", "_", os.path.basename(filename))
+        return sanitized_name or "uploaded_file"
 
-        Priority:
-        1) Folders whose name matches YYYYMMDD_HHMMSS or YYYYMMDD-HHMMSS are ranked by name (lexicographic)
-        2) Otherwise, pick the most recently modified subfolder
-        """
-        candidates: list[Path] = []
-        for base in self.output_base_folders:
-            if base.exists() and base.is_dir():
-                for child in base.iterdir():
-                    if child.is_dir():
-                        candidates.append(child)
-        if not candidates:
+    def _extension_is_allowed(self, file_path: Path) -> bool:
+        if not self.allowed_file_types:
+            return True
+        return file_path.suffix.lower() in self.allowed_file_types
+
+    def _resolve_file_path(self, file_like) -> Path | None:
+        if file_like is None:
             return None
+        candidate = None
+        if isinstance(file_like, (str, Path)):
+            candidate = Path(file_like)
+        elif isinstance(file_like, dict):
+            for key in ("path", "name", "file"):
+                value = file_like.get(key)
+                if value:
+                    candidate = Path(value)
+                    break
+        elif hasattr(file_like, "name") and getattr(file_like, "name"):
+            candidate = Path(file_like.name)
 
-        # Prefer date-named folders
-        date_re = re.compile(r"^\d{8}[-_]\d{6}$")
-        date_named = [c for c in candidates if date_re.match(c.name)]
-        if date_named:
-            return sorted(date_named, key=lambda p: p.name)[-1]
-        # Fallback: latest by mtime
-        return sorted(candidates, key=lambda p: p.stat().st_mtime)[-1]
+        if candidate is None:
+            return None
+        return candidate if candidate.exists() else None
 
-    def _list_files_in_dir(self, directory: Path, recursive: bool = True, max_files: int = 500) -> list[str]:
-        files: list[str] = []
-        try:
-            if recursive:
-                for root, _dirs, filenames in os.walk(directory):
-                    for fn in filenames:
-                        files.append(str(Path(root) / fn))
-                        if len(files) >= max_files:
-                            return files
-            else:
-                for child in directory.iterdir():
-                    if child.is_file():
-                        files.append(str(child))
-                        if len(files) >= max_files:
-                            return files
-        except Exception:
-            pass
-        return files
+    def _copy_into_uploads(self, source_path: Path) -> str:
+        if self.file_upload_folder is None:
+            raise ValueError("File uploads are disabled because no upload folder was provided.")
+        sanitized_name = self._sanitize_filename(source_path.name)
+        destination = self.file_upload_folder / sanitized_name
+        counter = 1
+        while destination.exists():
+            destination = self.file_upload_folder / f"{destination.stem}_{counter}{destination.suffix}"
+            counter += 1
+        shutil.copy(source_path, destination)
+        return str(destination)
+
+    def _extract_prompt_and_files(self, prompt_payload) -> tuple[str, list[str]]:
+        if prompt_payload is None:
+            return "", []
+
+        if isinstance(prompt_payload, list):
+            text_segments: list[str] = []
+            saved_files: list[str] = []
+            for item in prompt_payload:
+                if not isinstance(item, dict):
+                    continue
+                if item.get("type") == "text" and item.get("text"):
+                    text_segments.append(item["text"].strip())
+                elif item.get("type") == "file":
+                    file_payload = item.get("file") or item.get("path")
+                    resolved_path = self._resolve_file_path(file_payload)
+                    if resolved_path is None:
+                        continue
+                    if not self._extension_is_allowed(resolved_path):
+                        raise ValueError(f"File type {resolved_path.suffix} is not allowed.")
+                    saved_files.append(self._copy_into_uploads(resolved_path))
+            return "\n".join(filter(None, text_segments)).strip(), saved_files
+
+        if isinstance(prompt_payload, str):
+            return prompt_payload.strip(), []
+
+        resolved_path = self._resolve_file_path(prompt_payload)
+        if resolved_path is not None:
+            if not self._extension_is_allowed(resolved_path):
+                raise ValueError(f"File type {resolved_path.suffix} is not allowed.")
+            saved_file = self._copy_into_uploads(resolved_path)
+            return "", [saved_file]
+
+        return str(prompt_payload).strip(), []
 
     def interact_with_agent(self, prompt, messages, session_state):
         import gradio as gr
@@ -401,131 +420,94 @@ class GradioUI:
         if "agent" not in session_state:
             session_state["agent"] = self.agent
 
+        attached_files = session_state.get("latest_files", []) or []
+
         try:
-            # thinking_value accumulates simplified / structured thinking content
-            thinking_value = ""
+            display_content = prompt
+            if attached_files:
+                attachment_lines = "\n".join(f"- {Path(path).name}" for path in attached_files)
+                attachment_note = (
+                    "\n\n_Attachments saved locally (not sent to the agent):_\n" + attachment_lines
+                )
+                display_content = (display_content + attachment_note).strip()
 
-            messages.append(gr.ChatMessage(role="user", content=prompt, metadata={"status": "done"}))
-            # initialize pause/buffer flags in session state
-            session_state.setdefault("stream_paused", False)
-            session_state.setdefault("stream_buffer", [])
+            if not display_content:
+                display_content = "(files uploaded; no prompt text)"
 
-            # yield both chatbot messages and thinking content
-            yield messages, thinking_value
+            messages.append(gr.ChatMessage(role="user", content=display_content, metadata={"status": "done"}))
+            yield messages
 
             for msg in stream_to_gradio(
                 session_state["agent"], task=prompt, reset_agent_memory=self.reset_agent_memory
             ):
                 if isinstance(msg, gr.ChatMessage):
-                    # If paused, buffer the message and continue (no UI update)
-                    if session_state.get("stream_paused", False):
-                        buf = session_state.get("stream_buffer", []) or []
-                        buf.append(msg)
-                        session_state["stream_buffer"] = buf
-                        # Do not append to messages now; just yield current state
-                        yield messages, thinking_value
-                        continue
-
                     messages[-1].metadata["status"] = "done"
                     messages.append(msg)
-                    # Extract thinking-relevant pieces:
-                    try:
-                        meta = msg.metadata or {}
-                    except Exception:
-                        meta = {}
-                    # Normalize content to string when possible
-                    content_str = None
-                    if isinstance(msg.content, str):
-                        content_str = msg.content.strip()
-
-                    # 1) Step summary detection: e.g. "**Step 1 — Summary:** ..."
-                    import re as _re
-
-                    if content_str and _re.match(r"\*\*Step \d+ — Summary:.*", content_str):
-                        m = _re.match(r"\*\*(Step \d+) — Summary:\*\*\s*(.*)", content_str)
-                        if m:
-                            step_name = m.group(1)
-                            summary_text = m.group(2)
-                            thinking_value += f"- **{step_name}**: {summary_text}\n"
-                    # 2) Planning step header
-                    elif content_str and content_str.startswith("**Planning step**"):
-                        # include next line or the content as planning brief
-                        plan_brief = content_str.replace("**Planning step**", "").strip()
-                        thinking_value += f"- **Planning**: {plan_brief}\n"
-                    # 3) Collapsible details or explicit thinking sections -> append as expanded markdown/html
-                    elif meta.get("collapsible") or (content_str and ("<details>" in content_str or "Thinking (expand)" in content_str or content_str.startswith("###"))):
-                        thinking_value = thinking_value + "\n\n" + str(msg.content)
                 elif isinstance(msg, str):  # Then it's only a completion delta
                     msg = msg.replace("<", r"\<").replace(">", r"\>")  # HTML tags seem to break Gradio Chatbot
-                    if messages[-1].metadata.get("status") == "pending":
+                    if messages[-1].metadata["status"] == "pending":
                         messages[-1].content = msg
                     else:
                         messages.append(
                             gr.ChatMessage(role=MessageRole.ASSISTANT, content=msg, metadata={"status": "pending"})
                         )
-                # Always yield both outputs so the UI updates both sides
-                yield messages, thinking_value
+                yield messages
 
-            # final yield
-            yield messages, thinking_value
+            yield messages
         except Exception as e:
-            # On error, still return current messages and thinking content
-            try:
-                return_val = (messages, thinking_value)
-            except Exception:
-                return_val = (messages, "")
-            yield return_val
+            yield messages
             raise gr.Error(f"Error in interaction: {str(e)}")
+        finally:
+            session_state["latest_files"] = []
 
     def upload_file(self, file, file_uploads_log, allowed_file_types=None):
-        """
-        Upload a file and add it to the list of uploaded files in the session state.
-
-        The file is saved to the `self.file_upload_folder` folder.
-        If the file type is not allowed, it returns a message indicating the disallowed file type.
-
-        Args:
-            file (`gradio.File`): The uploaded file.
-            file_uploads_log (`list`): A list to log uploaded files.
-            allowed_file_types (`list`, *optional*): List of allowed file extensions. Defaults to [".pdf", ".docx", ".txt"].
-        """
+        """Upload a file triggered by a classic gr.File component (legacy helper)."""
         import gradio as gr
 
         if file is None:
             return gr.Textbox(value="No file uploaded", visible=True), file_uploads_log
 
-        if allowed_file_types is None:
-            # Allow per-instance override if provided at init, otherwise default conservative set
-            allowed_file_types = self.allowed_file_types or [".pdf", ".docx", ".txt"]
+        resolved_path = self._resolve_file_path(file)
+        if resolved_path is None:
+            return gr.Textbox(value="No file uploaded", visible=True), file_uploads_log
 
-        file_ext = os.path.splitext(file.name)[1].lower()
-        if file_ext not in allowed_file_types:
+        allowed_types = (
+            [ft.lower() if ft.startswith(".") else f".{ft.lower().lstrip('.')}" for ft in allowed_file_types]
+            if allowed_file_types
+            else self.allowed_file_types
+        )
+
+        if allowed_types and resolved_path.suffix.lower() not in allowed_types:
             return gr.Textbox("File type disallowed", visible=True), file_uploads_log
 
-        # Sanitize file name
-        original_name = os.path.basename(file.name)
-        sanitized_name = re.sub(
-            r"[^\w\-.]", "_", original_name
-        )  # Replace any non-alphanumeric, non-dash, or non-dot characters with underscores
+        try:
+            saved_path = self._copy_into_uploads(resolved_path)
+        except ValueError as exc:  # Raised when no upload folder is configured
+            raise gr.Error(str(exc)) from exc
 
-        # Save the uploaded file to the specified folder
-        file_path = os.path.join(self.file_upload_folder, os.path.basename(sanitized_name))
-        shutil.copy(file.name, file_path)
+        return gr.Textbox(f"File uploaded: {saved_path}", visible=True), file_uploads_log + [saved_path]
 
-        return gr.Textbox(f"File uploaded: {file_path}", visible=True), file_uploads_log + [file_path]
-
-    def log_user_message(self, text_input, file_uploads_log):
+    def log_user_message(self, prompt_payload, file_uploads_log, session_state):
         import gradio as gr
 
+        try:
+            prompt_text, saved_files = self._extract_prompt_and_files(prompt_payload)
+        except ValueError as exc:
+            raise gr.Error(str(exc)) from exc
+
+        if not prompt_text and not saved_files:
+            raise gr.Error("Please enter a prompt or attach a supported file.")
+
+        session_state.setdefault("latest_files", [])
+        session_state["latest_files"] = saved_files
+
+        updated_log = (file_uploads_log or []) + saved_files
+
         return (
-            text_input
-            + (
-                f"\nYou have been provided with these files, which might be helpful or not: {file_uploads_log}"
-                if len(file_uploads_log) > 0
-                else ""
-            ),
-            "",
-            gr.Button(interactive=False),
+            prompt_text,
+            gr.update(value=None),
+            gr.update(interactive=False),
+            updated_log,
         )
 
     def launch(self, share: bool = True, **kwargs):
@@ -544,7 +526,7 @@ class GradioUI:
         with gr.Blocks(theme="ocean", fill_height=True) as demo:
             # Add session state to store session-specific data
             session_state = gr.State({})
-            stored_messages = gr.State([])
+            stored_messages = gr.State("")
             file_uploads_log = gr.State([])
 
             with gr.Sidebar():
@@ -554,154 +536,73 @@ class GradioUI:
                     + (f"\n\n**Agent description:**\n{self.description}" if self.description else "")
                 )
 
-                with gr.Group():
-                    gr.Markdown("**Your request**", container=True)
-                    text_input = gr.Textbox(
-                        lines=3,
-                        label="Chat Message",
-                        container=False,
-                        placeholder="Enter your prompt here and press Shift+Enter or press the button",
-                    )
+            chatbot = gr.Chatbot(
+                label="Agent",
+                type="messages",
+                avatar_images=(
+                    None,
+                    "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/smolagents/mascot_smol.png",
+                ),
+                resizeable=True,
+                scale=1,
+                latex_delimiters=[
+                    {"left": r"$$", "right": r"$$", "display": True},
+                    {"left": r"$", "right": r"$", "display": False},
+                    {"left": r"\[", "right": r"\]", "display": True},
+                    {"left": r"\(", "right": r"\)", "display": False},
+                ],
+            )
+
+            supports_inline_uploads = self.file_upload_folder is not None and hasattr(gr, "MultimodalTextbox")
+            placeholder = "Enter a prompt. Paste or drop files to save them locally (not shared with the agent)."
+
+            with gr.Row(equal_height=True):
+                with gr.Column(scale=9):
+                    if supports_inline_uploads:
+                        text_input = gr.MultimodalTextbox(
+                            label="Chat Message",
+                            show_label=False,
+                            placeholder=placeholder,
+                            file_types=self.allowed_file_types or None,
+                            file_count="multiple",
+                        )
+                    else:
+                        text_input = gr.Textbox(
+                            lines=3,
+                            label="Chat Message",
+                            show_label=False,
+                            placeholder=placeholder,
+                        )
+                with gr.Column(scale=2, min_width=140):
                     submit_btn = gr.Button("Submit", variant="primary")
 
-                # If an upload folder is provided, enable the upload feature
-                if self.file_upload_folder is not None:
-                    upload_file = gr.File(label="Upload a file")
-                    upload_status = gr.Textbox(label="Upload Status", interactive=False, visible=False)
-                    upload_file.change(
-                        self.upload_file,
-                        [upload_file, file_uploads_log],
-                        [upload_status, file_uploads_log],
-                    )
-
-                # Output files viewer (latest date-named folder under output/ or outputs/)
-                with gr.Group():
-                    gr.Markdown("**Latest outputs**", container=True)
-                    latest_dir_md = gr.Markdown("No output folder found yet.")
-                    output_files_dropdown = gr.Dropdown(choices=[], label="Files in latest output", interactive=True)
-                    download_selected_btn = gr.DownloadButton(
-                        label="Download selected file",
-                        value=None,
-                        variant="secondary",
-                    )
-                    refresh_btn = gr.Button("Refresh outputs", variant="secondary")
-
-                    def _refresh_outputs():
-                        latest = self._find_latest_output_dir()
-                        if latest is None:
-                            return (
-                                gr.update(value="No output folder found yet."),
-                                gr.update(choices=[], value=None),
-                                gr.update(value=None),
-                            )
-                        files = self._list_files_in_dir(latest)
-                        pretty = f"Latest output directory: {latest} (files: {len(files)})"
-                        first = files[0] if files else None
-                        return (
-                            gr.update(value=pretty),
-                            gr.update(choices=files, value=first),
-                            gr.update(value=first),
-                        )
-
-                    def _select_output_file(selected):
-                        return gr.update(value=selected)
-
-                    # Wire events
-                    refresh_btn.click(_refresh_outputs, None, [latest_dir_md, output_files_dropdown, download_selected_btn])
-                    output_files_dropdown.change(_select_output_file, [output_files_dropdown], [download_selected_btn])
-
-                gr.HTML(
-                    "<br><br><h4><center>Powered by <a target='_blank' href='https://github.com/huggingface/smolagents'><b>smolagents</b></a></center></h4>"
-                )
-
-            # Main chat interface - split into two columns: left=streaming/chat, right=thinking steps
-            with gr.Row():
-                with gr.Column(scale=3):
-                    chatbot = gr.Chatbot(
-                        label="Agent",
-                        type="messages",
-                        avatar_images=(
-                            None,
-                            "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/smolagents/mascot_smol.png",
-                        ),
-                        resizeable=True,
-                        scale=1,
-                        latex_delimiters=[
-                            {"left": r"$$", "right": r"$$", "display": True},
-                            {"left": r"$", "right": r"$", "display": False},
-                            {"left": r"\\[", "right": r"\\]", "display": True},
-                            {"left": r"\\(", "right": r"\\)", "display": False},
-                        ],
-                    )
-                with gr.Column(scale=1):
-                    # Controls for left/chat column and right/thinking column
-                    with gr.Row():
-                        clear_btn = gr.Button("Clear Chat", variant="secondary")
-                        pause_btn = gr.Button("Pause Stream", variant="secondary")
-                        copy_thinking_btn = gr.Button("Copy Thinking", variant="secondary")
-                    thinking_md = gr.Markdown(value="No thinking yet.", label="Thinking")
-                    # hidden box to populate when copying thinking content so user can easily copy text
-                    thinking_copy_box = gr.Textbox(value="", visible=False)
-
-                    # Wire simple control callbacks
-                    def _clear_chat(stored_messages):
-                        # Clear chat messages and reset stored_messages state
-                        return gr.update(value=[]), []
-
-                    def _toggle_pause(session_state, stored_messages):
-                        # Toggle paused state; when resuming, flush buffered messages
-                        paused = session_state.get("stream_paused", False)
-                        if paused:
-                            # currently paused -> resume
-                            buf = session_state.get("stream_buffer", []) or []
-                            # append buffered chat messages to stored_messages
-                            new_msgs = list(stored_messages) if stored_messages else []
-                            new_msgs.extend(buf)
-                            # clear buffer and paused flag
-                            session_state["stream_buffer"] = []
-                            session_state["stream_paused"] = False
-                            return gr.update(value=new_msgs), new_msgs
-                        else:
-                            # pause: set flag
-                            session_state["stream_paused"] = True
-                            session_state.setdefault("stream_buffer", [])
-                            return gr.update(value=stored_messages), stored_messages
-
-                    def _copy_thinking(thinking_value):
-                        # Put thinking content into a textbox for easy copying
-                        return gr.update(value=thinking_value, visible=True)
-
-                    clear_btn.click(_clear_chat, [stored_messages], [chatbot, stored_messages])
-                    pause_btn.click(_toggle_pause, [session_state, stored_messages], [chatbot, stored_messages])
-                    copy_thinking_btn.click(_copy_thinking, [thinking_md], [thinking_copy_box])
-
-            # Set up event handlers
+            gr.HTML(
+                "<br><br><h4><center>Powered by <a target='_blank' href='https://github.com/huggingface/smolagents'><b>smolagents</b></a></center></h4>"
+            )
             text_input.submit(
                 self.log_user_message,
-                [text_input, file_uploads_log],
-                [stored_messages, text_input, submit_btn],
-            ).then(self.interact_with_agent, [stored_messages, chatbot, session_state], [chatbot, thinking_md]).then(
-                lambda: (
-                    gr.Textbox(
-                        interactive=True, placeholder="Enter your prompt here and press Shift+Enter or the button"
-                    ),
-                    gr.Button(interactive=True),
-                ),
+                [text_input, file_uploads_log, session_state],
+                [stored_messages, text_input, submit_btn, file_uploads_log],
+            ).then(
+                self.interact_with_agent,
+                [stored_messages, chatbot, session_state],
+                [chatbot],
+            ).then(
+                lambda: (gr.update(interactive=True), gr.update(interactive=True)),
                 None,
                 [text_input, submit_btn],
             )
 
             submit_btn.click(
                 self.log_user_message,
-                [text_input, file_uploads_log],
-                [stored_messages, text_input, submit_btn],
-            ).then(self.interact_with_agent, [stored_messages, chatbot, session_state], [chatbot, thinking_md]).then(
-                lambda: (
-                    gr.Textbox(
-                        interactive=True, placeholder="Enter your prompt here and press Shift+Enter or the button"
-                    ),
-                    gr.Button(interactive=True),
-                ),
+                [text_input, file_uploads_log, session_state],
+                [stored_messages, text_input, submit_btn, file_uploads_log],
+            ).then(
+                self.interact_with_agent,
+                [stored_messages, chatbot, session_state],
+                [chatbot],
+            ).then(
+                lambda: (gr.update(interactive=True), gr.update(interactive=True)),
                 None,
                 [text_input, submit_btn],
             )
