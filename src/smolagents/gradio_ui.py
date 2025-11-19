@@ -13,6 +13,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import ast
+import json
 import os
 import re
 import shutil
@@ -56,6 +58,9 @@ def _clean_model_output(model_output: str) -> str:
     return model_output.strip()
 
 
+_DICT_BLOCK_PATTERN = re.compile(r"\{[^{}]*\}", re.DOTALL)
+
+
 def _format_code_content(content: str) -> str:
     """
     Format code content as Python code block if it's not already formatted.
@@ -75,6 +80,195 @@ def _format_code_content(content: str) -> str:
     if not content.startswith("```python"):
         content = f"```python\n{content}\n```"
     return content
+
+
+def _as_stream_payload(execution_log: str | None, full_log: str | None) -> dict[str, str]:
+    return {
+        "execution_log": (execution_log or "").strip(),
+        "full_log": full_log or "",
+    }
+
+
+def _maybe_dict_from_string(payload) -> dict | None:
+    if isinstance(payload, str):
+        text = payload.strip()
+        candidate = text
+        if not (text.startswith("{") and text.endswith("}")):
+            start = text.find("{")
+            end = text.rfind("}")
+            if start == -1 or end == -1 or end <= start:
+                candidate = None
+            else:
+                candidate = text[start : end + 1]
+        if candidate:
+            try:
+                return json.loads(candidate)
+            except json.JSONDecodeError:
+                try:
+                    return ast.literal_eval(candidate)
+                except (ValueError, SyntaxError):
+                    return None
+    if isinstance(payload, dict):
+        return payload
+    return None
+
+
+def _extract_execution_text(block: str) -> str:
+    """Extract execution_log text from mixed observation strings containing dict blocks."""
+    if not block:
+        return ""
+    text = block.strip()
+    if not text:
+        return ""
+
+    pieces: list[str] = []
+    saw_dict = False
+    cursor = 0
+    for match in _DICT_BLOCK_PATTERN.finditer(text):
+        saw_dict = True
+        prefix = text[cursor:match.start()].strip()
+        data = _maybe_dict_from_string(match.group(0))
+        if data and "execution_log" in data:
+            exec_text = str(data.get("execution_log") or "").strip()
+            if exec_text:
+                if prefix:
+                    normalized = prefix.rstrip()
+                    suffix = ":" if normalized.endswith(":") else ""
+                    normalized = normalized[:-1].rstrip() if suffix else normalized
+                    if normalized:
+                        pieces.append(f"{normalized}:{exec_text}")
+                    else:
+                        pieces.append(exec_text)
+                else:
+                    pieces.append(exec_text)
+        cursor = match.end()
+
+    if pieces:
+        return "\n\n".join(pieces).strip()
+
+    if saw_dict:
+        stripped = _DICT_BLOCK_PATTERN.sub("", text)
+        stripped = re.sub(r"^Execution logs:\s*", "", stripped, flags=re.IGNORECASE).strip()
+        return stripped
+
+    cleaned = re.sub(r"^Execution logs:\s*", "", text, flags=re.IGNORECASE).strip()
+    return cleaned
+
+
+def _extract_tool_logs(action_output) -> tuple[str, str]:
+    maybe_dict = _maybe_dict_from_string(action_output)
+    if maybe_dict is not None and {"execution_log", "full_log"}.issubset(maybe_dict.keys()):
+        exec_log = maybe_dict.get("execution_log") or ""
+        full_log = maybe_dict.get("full_log") or ""
+        return str(exec_log), str(full_log)
+    if isinstance(action_output, dict) and {"execution_log", "full_log"}.issubset(action_output.keys()):
+        exec_log = action_output.get("execution_log") or ""
+        full_log = action_output.get("full_log") or ""
+        return str(exec_log), str(full_log)
+    if action_output is None:
+        return "", ""
+    return str(action_output), ""
+
+
+def _render_final_answer_logs(step_log: FinalAnswerStep) -> tuple[str, str]:
+    final_answer = step_log.output
+    if isinstance(final_answer, AgentText):
+        text = final_answer.to_string()
+    elif isinstance(final_answer, (AgentImage, AgentAudio)):
+        text = final_answer.to_string()
+    else:
+        text = str(final_answer)
+    formatted = f"**Final answer:**\n{text}" if text else "Final answer provided."
+    return formatted, formatted
+
+
+def _step_to_full_markdown(step_log: ActionStep | PlanningStep | FinalAnswerStep) -> str:
+    parts: list[str] = []
+
+    if isinstance(step_log, ActionStep):
+        step_number = f"Step {step_log.step_number}"
+        parts.append(f"**{step_number}**")
+
+        model_output = getattr(step_log, "model_output", "")
+        if model_output:
+            parts.append(_clean_model_output(model_output))
+
+        tool_calls = getattr(step_log, "tool_calls", []) or []
+        if tool_calls:
+            first_tool_call = tool_calls[0]
+            args = first_tool_call.arguments
+            if isinstance(args, dict):
+                content = str(args.get("answer", args))
+            else:
+                content = str(args).strip()
+
+            if first_tool_call.name == "python_interpreter":
+                content = _format_code_content(content)
+
+            parts.append(f"**🛠️ Used tool `{first_tool_call.name}`**\n\n{content}")
+
+        observations = getattr(step_log, "observations", "")
+        if observations and observations.strip():
+            log_content = re.sub(r"^Execution logs:\s*", "", observations.strip())
+            parts.append(f"```bash\n{log_content}\n```")
+
+        images = getattr(step_log, "observations_images", []) or []
+        for image in images:
+            path_image = AgentImage(image).to_string()
+            parts.append(f"![Output image]({path_image})")
+
+        if getattr(step_log, "error", None):
+            parts.append(f"**Error:** {step_log.error}")
+
+        parts.append(get_step_footnote_content(step_log, step_number))
+        parts.append("-----")
+        return "\n\n".join(part for part in parts if part).strip()
+
+    if isinstance(step_log, PlanningStep):
+        parts.append("**Planning step**")
+        if step_log.plan:
+            parts.append(step_log.plan)
+        parts.append(get_step_footnote_content(step_log, "Planning step"))
+        parts.append("-----")
+        return "\n\n".join(part for part in parts if part).strip()
+
+    if isinstance(step_log, FinalAnswerStep):
+        _, full_log = _render_final_answer_logs(step_log)
+        return full_log
+
+    return ""
+
+
+def _step_to_stream_payload(step_log: ActionStep | PlanningStep | FinalAnswerStep) -> dict[str, str]:
+    full_markdown = _step_to_full_markdown(step_log)
+    if isinstance(step_log, ActionStep):
+        exec_log, tool_full = _extract_tool_logs(step_log.action_output)
+        full_log_parts: list[str] = []
+        if tool_full:
+            full_log_parts.append(tool_full)
+        if step_log.observations:
+            full_log_parts.append(step_log.observations)
+        if step_log.error:
+            full_log_parts.append(f"Error: {step_log.error}")
+        if not exec_log and step_log.observations:
+            observations = step_log.observations.strip()
+            execution_text = _extract_execution_text(observations)
+            if execution_text:
+                exec_log = execution_text
+        if not exec_log and step_log.error:
+            exec_log = f"Error: {step_log.error}"
+        if not exec_log:
+            exec_log = "Action step completed."
+        full_log = "\n\n".join(part for part in full_log_parts if part)
+        if not full_log:
+            full_log = exec_log
+        return _as_stream_payload(exec_log, full_markdown or full_log)
+    if isinstance(step_log, PlanningStep):
+        return _as_stream_payload("", full_markdown or step_log.plan)
+    if isinstance(step_log, FinalAnswerStep):
+        exec_log, full_log = _render_final_answer_logs(step_log)
+        return _as_stream_payload(exec_log, full_markdown or full_log)
+    return _as_stream_payload("", "")
 
 
 def _process_action_step(step_log: ActionStep, skip_model_outputs: bool = False) -> Generator:
@@ -129,9 +323,8 @@ def _process_action_step(step_log: ActionStep, skip_model_outputs: bool = False)
 
     # Display execution logs if they exist
     if getattr(step_log, "observations", "") and step_log.observations.strip():
-        log_content = step_log.observations.strip()
+        log_content = _extract_execution_text(step_log.observations)
         if log_content:
-            log_content = re.sub(r"^Execution logs:\s*", "", log_content)
             yield gr.ChatMessage(
                 role=MessageRole.ASSISTANT,
                 content=f"```bash\n{log_content}\n",
@@ -259,21 +452,27 @@ def stream_to_gradio(
             "Please install 'gradio' extra to use the GradioUI: `pip install 'smolagents[gradio]'`"
         )
     accumulated_events: list[ChatMessageStreamDelta] = []
+    last_stream_text = ""
     for event in agent.run(
         task, images=task_images, stream=True, reset=reset_agent_memory, additional_args=additional_args
     ):
-        if isinstance(event, ActionStep | PlanningStep | FinalAnswerStep):
-            for message in pull_messages_from_step(
-                event,
-                # If we're streaming model outputs, no need to display them twice
-                skip_model_outputs=getattr(agent, "stream_outputs", False),
-            ):
-                yield message
+        if isinstance(event, (ActionStep, PlanningStep, FinalAnswerStep)):
+            yield _step_to_stream_payload(event)
             accumulated_events = []
+            last_stream_text = ""
         elif isinstance(event, ChatMessageStreamDelta):
             accumulated_events.append(event)
             text = agglomerate_stream_deltas(accumulated_events).render_as_markdown()
-            yield text
+            if not text:
+                continue
+            if last_stream_text and text.startswith(last_stream_text):
+                new_piece = text[len(last_stream_text) :]
+            else:
+                new_piece = text
+            if not new_piece:
+                continue
+            last_stream_text = text
+            yield _as_stream_payload("", new_piece)
 
 
 class GradioUI:
@@ -309,6 +508,11 @@ class GradioUI:
         ```
     """
 
+    _IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tiff"}
+    _TEXT_EXTENSIONS = {".txt", ".md", ".log", ".csv"}
+    _JSON_EXTENSIONS = {".json"}
+    _PDF_EXTENSIONS = {".pdf"}
+
     def __init__(
         self,
         agent: MultiStepAgent,
@@ -331,7 +535,8 @@ class GradioUI:
             if allowed_file_types
             else [".pdf", ".docx", ".txt"]
         )
-        self.output_base_folders = [Path(folder) for folder in (output_base_folders or [])]
+        base_folders = output_base_folders if output_base_folders else ["output"]
+        self.output_base_folders = [Path(folder) for folder in base_folders]
 
         if self.file_upload_folder is not None:
             if not self.file_upload_folder.exists():
@@ -413,17 +618,96 @@ class GradioUI:
 
         return str(prompt_payload).strip(), []
 
+    def _detect_output_type(self, file_path: Path) -> str:
+        suffix = file_path.suffix.lower()
+        if suffix in self._IMAGE_EXTENSIONS:
+            return "image"
+        if suffix in self._JSON_EXTENSIONS:
+            return "json"
+        if suffix in self._TEXT_EXTENSIONS:
+            return "text"
+        if suffix in self._PDF_EXTENSIONS:
+            return "pdf"
+        return "other"
+
+    def _read_text_preview(self, file_path: Path, limit: int = 2000) -> str:
+        try:
+            with file_path.open("r", encoding="utf-8", errors="ignore") as handle:
+                snippet = handle.read(limit)
+            if file_path.stat().st_size > limit:
+                snippet = snippet.rstrip() + "\n..."
+            return snippet.strip()
+        except Exception as exc:  # pragma: no cover - best effort preview only
+            return f"无法读取文本文件：{exc}"
+
+    def _read_json_preview(self, file_path: Path):
+        try:
+            with file_path.open("r", encoding="utf-8", errors="ignore") as handle:
+                data = json.load(handle)
+            return data
+        except Exception as exc:  # pragma: no cover - best effort preview only
+            return {"error": f"无法解析 JSON：{exc}", "path": str(file_path)}
+
+    def load_latest_output_files(self) -> dict | None:
+        candidate_dirs: list[Path] = []
+        for base in self.output_base_folders:
+            if not base.exists():
+                continue
+            for child in base.iterdir():
+                if child.is_dir():
+                    candidate_dirs.append(child)
+
+        if not candidate_dirs:
+            return None
+
+        latest_dir = max(candidate_dirs, key=lambda folder: folder.stat().st_mtime)
+        file_entries = []
+        for child in sorted(latest_dir.iterdir()):
+            if not child.is_file():
+                continue
+            file_type = self._detect_output_type(child)
+            entry: dict = {
+                "path": str(child),
+                "name": child.name,
+                "type": file_type,
+            }
+            if file_type == "text":
+                entry["content"] = self._read_text_preview(child)
+            elif file_type == "json":
+                entry["json_content"] = self._read_json_preview(child)
+            file_entries.append(entry)
+
+        return {"folder": str(latest_dir), "files": file_entries}
+
+    def update_output_box(self):
+        import gradio as gr
+
+        payload = self.load_latest_output_files()
+        files = payload.get("files", []) if payload else []
+        if not files:
+            return (
+                gr.update(value="`output/` 中暂无可供下载的文件。", visible=True),
+                gr.update(value=None, visible=False),
+            )
+
+        downloadable_files = [entry["path"] for entry in files]
+
+        return (
+            gr.update(value="", visible=False),
+            gr.update(value=downloadable_files, visible=True, file_count="multiple"),
+        )
+
     def interact_with_agent(self, prompt, messages, session_state):
         import gradio as gr
 
-        # Get the agent type from the template agent
         if "agent" not in session_state:
             session_state["agent"] = self.agent
 
         attached_files = session_state.get("latest_files", []) or []
 
+        exec_index: int | None = None
         try:
-            display_content = prompt
+            display_content = prompt or ""
             if attached_files:
                 attachment_lines = "\n".join(f"- {Path(path).name}" for path in attached_files)
                 attachment_note = (
@@ -435,30 +719,60 @@ class GradioUI:
                 display_content = "(files uploaded; no prompt text)"
 
             messages.append(gr.ChatMessage(role="user", content=display_content, metadata={"status": "done"}))
-            yield messages
+            session_state.setdefault("full_buffer", "")
+            session_state["full_buffer"] = ""
+            session_state.setdefault("exec_buffer", "")
+            session_state["exec_buffer"] = ""
+            session_state["step"] = 1
+
+            exec_msg = gr.ChatMessage(role="assistant", content="", metadata={"type": "exec", "status": "pending"})
+            messages.append(exec_msg)
+            exec_index = len(messages) - 1
+
+            def _full_reason_update():
+                full_buffer = session_state.get("full_buffer", "")
+                content = full_buffer or "_No reasoning yet._"
+                return gr.update(value=content)
+
+            yield messages, _full_reason_update()
 
             for msg in stream_to_gradio(
                 session_state["agent"], task=prompt, reset_agent_memory=self.reset_agent_memory
             ):
-                if isinstance(msg, gr.ChatMessage):
-                    messages[-1].metadata["status"] = "done"
-                    messages.append(msg)
-                elif isinstance(msg, str):  # Then it's only a completion delta
-                    msg = msg.replace("<", r"\<").replace(">", r"\>")  # HTML tags seem to break Gradio Chatbot
-                    if messages[-1].metadata["status"] == "pending":
-                        messages[-1].content = msg
-                    else:
-                        messages.append(
-                            gr.ChatMessage(role=MessageRole.ASSISTANT, content=msg, metadata={"status": "pending"})
-                        )
-                yield messages
+                if isinstance(msg, dict) and {"execution_log", "full_log"}.issubset(msg.keys()):
+                    exec_piece = msg.get("execution_log") or ""
+                    full_piece = msg.get("full_log") or ""
+                    if exec_piece:
+                        step = session_state.get("step", 1)
+                        append = f"### Step {step}\n{exec_piece}\n\n"
+                        session_state["exec_buffer"] += append
+                        messages[exec_index].content = session_state["exec_buffer"].rstrip()
+                        session_state["step"] = step + 1
+                    if full_piece:
+                        session_state["full_buffer"] += full_piece
+                    yield messages, _full_reason_update()
+                    continue
 
-            yield messages
+                if isinstance(msg, gr.ChatMessage):
+                    messages.append(msg)
+                    yield messages, _full_reason_update()
+                elif isinstance(msg, str):
+                    session_state["full_buffer"] += msg
+                    yield messages, _full_reason_update()
+
+            if exec_index is not None:
+                messages[exec_index].metadata["status"] = "done"
+            yield messages, _full_reason_update()
         except Exception as e:
-            yield messages
+            yield messages, _full_reason_update()
             raise gr.Error(f"Error in interaction: {str(e)}")
         finally:
             session_state["latest_files"] = []
+            if exec_index is not None and exec_index < len(messages):
+                messages[exec_index].metadata["status"] = "done"
+            session_state["exec_buffer"] = ""
+            session_state["full_buffer"] = ""
+            session_state["step"] = 1
 
     def upload_file(self, file, file_uploads_log, allowed_file_types=None):
         """Upload a file triggered by a classic gr.File component (legacy helper)."""
@@ -505,8 +819,7 @@ class GradioUI:
 
         return (
             prompt_text,
-            gr.update(value=None),
-            gr.update(interactive=False),
+            gr.update(value=None, interactive=False),
             updated_log,
         )
 
@@ -535,76 +848,147 @@ class GradioUI:
                     "\n> This web ui allows you to interact with a `smolagents` agent that can use tools and execute steps to complete tasks."
                     + (f"\n\n**Agent description:**\n{self.description}" if self.description else "")
                 )
+                with gr.Accordion("输出文件", open=False):
+                    output_status = gr.Markdown("`output/` 中暂无可供下载的文件。")
+                    output_downloads = gr.Files(
+                        label="全部文件下载",
+                        file_count="multiple",
+                        interactive=False,
+                        visible=False,
+                        elem_classes=["output-downloads"],
+                    )
+                    refresh_outputs = gr.Button("刷新输出文件", variant="secondary")
+                    gr.HTML(
+                        """<style>
+.output-downloads {
+    width: 100%;
+    max-width: 100%;
+}
 
-            chatbot = gr.Chatbot(
-                label="Agent",
-                type="messages",
-                avatar_images=(
-                    None,
-                    "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/smolagents/mascot_smol.png",
-                ),
-                resizeable=True,
-                scale=1,
-                latex_delimiters=[
-                    {"left": r"$$", "right": r"$$", "display": True},
-                    {"left": r"$", "right": r"$", "display": False},
-                    {"left": r"\[", "right": r"\]", "display": True},
-                    {"left": r"\(", "right": r"\)", "display": False},
-                ],
-            )
+.output-downloads .file-preview {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    gap: 0.5rem;
+    align-items: center;
+    width: 100%;
+    overflow: visible;
+}
 
-            supports_inline_uploads = self.file_upload_folder is not None and hasattr(gr, "MultimodalTextbox")
-            placeholder = "Enter a prompt. Paste or drop files to save them locally (not shared with the agent)."
+.output-downloads .file-preview li {
+    width: 100%;
+    display: contents;
+}
 
-            with gr.Row(equal_height=True):
-                with gr.Column(scale=9):
-                    if supports_inline_uploads:
-                        text_input = gr.MultimodalTextbox(
-                            label="Chat Message",
-                            show_label=False,
-                            placeholder=placeholder,
-                            file_types=self.allowed_file_types or None,
-                            file_count="multiple",
-                        )
-                    else:
-                        text_input = gr.Textbox(
-                            lines=3,
-                            label="Chat Message",
-                            show_label=False,
-                            placeholder=placeholder,
-                        )
-                with gr.Column(scale=2, min_width=140):
-                    submit_btn = gr.Button("Submit", variant="primary")
+.output-downloads .file-preview span,
+.output-downloads .file-preview a,
+.output-downloads .file-preview button {
+    white-space: normal;
+    word-break: break-word;
+    overflow-wrap: anywhere;
+}
+
+.output-downloads .file-preview button {
+    width: auto;
+    justify-self: end;
+}
+</style>"""
+                    )
+
+            with gr.Column(scale=1, elem_classes=["agent-column"]):
+                chatbot = gr.Chatbot(
+                    label="Agent",
+                    type="messages",
+                    avatar_images=(
+                        None,
+                        "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/smolagents/mascot_smol.png",
+                    ),
+                    resizeable=True,
+                    scale=1,
+                    latex_delimiters=[
+                        {"left": r"$$", "right": r"$$", "display": True},
+                        {"left": r"$", "right": r"$", "display": False},
+                        {"left": r"\[", "right": r"\]", "display": True},
+                        {"left": r"\(", "right": r"\)", "display": False},
+                    ],
+                )
+
+                with gr.Accordion("🔎 Full reasoning", open=False, elem_classes=["full-reasoning-accordion"]):
+                    full_reasoning_md = gr.Markdown("_No reasoning yet._", elem_classes=["full-reasoning-md"])
+
+                supports_inline_uploads = self.file_upload_folder is not None and hasattr(gr, "MultimodalTextbox")
+                placeholder = "Enter a prompt. Paste or drop files to save them locally (not shared with the agent)."
+
+                if supports_inline_uploads:
+                    text_input = gr.MultimodalTextbox(
+                        label="Chat Message",
+                        show_label=False,
+                        placeholder=placeholder,
+                        file_types=self.allowed_file_types or None,
+                        file_count="multiple",
+                    )
+                else:
+                    text_input = gr.Textbox(
+                        lines=3,
+                        label="Chat Message",
+                        show_label=False,
+                        placeholder=placeholder,
+                    )
 
             gr.HTML(
-                "<br><br><h4><center>Powered by <a target='_blank' href='https://github.com/huggingface/smolagents'><b>smolagents</b></a></center></h4>"
+                """<style>
+.agent-column {
+    min-height: 60vh;
+}
+.full-reasoning-accordion {
+    width: 100%;
+}
+.full-reasoning-md {
+    width: 100%;
+    max-height: 40vh;
+    overflow-y: auto;
+    padding-right: 0.5rem;
+    word-break: break-word;
+    overflow-wrap: anywhere;
+    white-space: normal;
+}
+.full-reasoning-md *:not(pre):not(code) {
+    word-break: break-word;
+    overflow-wrap: anywhere;
+    white-space: normal;
+}
+.full-reasoning-md pre,
+.full-reasoning-md code {
+    white-space: pre-wrap;
+    word-break: break-word;
+    overflow-wrap: anywhere;
+}
+</style>"""
             )
+
+            output_components = [
+                output_status,
+                output_downloads,
+            ]
+
+            demo.load(self.update_output_box, None, output_components)
+            refresh_outputs.click(self.update_output_box, None, output_components)
+
             text_input.submit(
                 self.log_user_message,
                 [text_input, file_uploads_log, session_state],
-                [stored_messages, text_input, submit_btn, file_uploads_log],
+                [stored_messages, text_input, file_uploads_log],
             ).then(
                 self.interact_with_agent,
                 [stored_messages, chatbot, session_state],
-                [chatbot],
+                [chatbot, full_reasoning_md],
             ).then(
-                lambda: (gr.update(interactive=True), gr.update(interactive=True)),
+                self.update_output_box,
                 None,
-                [text_input, submit_btn],
-            )
-
-            submit_btn.click(
-                self.log_user_message,
-                [text_input, file_uploads_log, session_state],
-                [stored_messages, text_input, submit_btn, file_uploads_log],
+                output_components,
             ).then(
-                self.interact_with_agent,
-                [stored_messages, chatbot, session_state],
-                [chatbot],
-            ).then(
-                lambda: (gr.update(interactive=True), gr.update(interactive=True)),
+                lambda: gr.update(interactive=True),
                 None,
-                [text_input, submit_btn],
+                [text_input],
             )
 
             chatbot.clear(self.agent.memory.reset)

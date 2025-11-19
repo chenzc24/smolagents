@@ -134,21 +134,26 @@ class GradioUITester(unittest.TestCase):
 class TestStreamToGradio:
     """Tests for the stream_to_gradio function."""
 
-    @patch("smolagents.gradio_ui.pull_messages_from_step")
-    def test_stream_to_gradio_memory_step(self, mock_pull_messages):
-        """Test streaming a memory step"""
-        # Create mock agent and memory step
+    def test_stream_to_gradio_memory_step(self):
+        """Test streaming an action step payload."""
         mock_agent = Mock()
-        mock_agent.run = Mock(return_value=[Mock(spec=ActionStep)])
+        step = ActionStep(
+            step_number=1,
+            timing=Timing(start_time=0.0, end_time=1.0),
+            observations="Execution logs captured",
+        )
+        step.action_output = {"execution_log": "Step done", "full_log": "Detailed log"}
+        mock_agent.run = Mock(return_value=[step])
         mock_agent.model = Mock()
-        # Mock the pull_messages_from_step function to return some messages
-        mock_message = Mock()
-        mock_pull_messages.return_value = [mock_message]
-        # Call stream_to_gradio
+
         result = list(stream_to_gradio(mock_agent, "test task"))
-        # Verify that pull_messages_from_step was called and the message was yielded
-        mock_pull_messages.assert_called_once()
-        assert result == [mock_message]
+
+        assert result == [
+            {
+                "execution_log": "Step done",
+                "full_log": "Detailed log\n\nExecution logs captured",
+            }
+        ]
 
     def test_stream_to_gradio_stream_delta(self):
         """Test streaming a ChatMessageStreamDelta"""
@@ -160,7 +165,7 @@ class TestStreamToGradio:
         # Call stream_to_gradio
         result = list(stream_to_gradio(mock_agent, "test task"))
         # Verify that the content was yielded
-        assert result == ["Hello"]
+        assert result == [{"execution_log": "", "full_log": "Hello"}]
 
     def test_stream_to_gradio_multiple_deltas(self):
         """Test streaming multiple ChatMessageStreamDeltas"""
@@ -173,7 +178,10 @@ class TestStreamToGradio:
         # Call stream_to_gradio
         result = list(stream_to_gradio(mock_agent, "test task"))
         # Verify that the content was accumulated and yielded
-        assert result == ["Hello", "Hello world"]
+        assert result == [
+            {"execution_log": "", "full_log": "Hello"},
+            {"execution_log": "", "full_log": "Hello world"},
+        ]
 
     @pytest.mark.parametrize(
         "task,task_images,reset_memory,additional_args",
