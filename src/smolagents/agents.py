@@ -1700,20 +1700,14 @@ class CodeAgent(MultiStepAgent):
             code_output = self.python_executor(code_action)
             execution_outputs_console = []
             if len(code_output.logs) > 0:
-                execution_outputs_console += [
-                    Text("Execution logs:", style="bold"),
-                    Text(code_output.logs),
-                ]
-            observation = "Execution logs:\n" + code_output.logs
+                execution_outputs_console += [Text(code_output.logs)]
+            observation = code_output.logs
         except Exception as e:
             if hasattr(self.python_executor, "state") and "_print_outputs" in self.python_executor.state:
                 execution_logs = str(self.python_executor.state["_print_outputs"])
                 if len(execution_logs) > 0:
-                    execution_outputs_console = [
-                        Text("Execution logs:", style="bold"),
-                        Text(execution_logs),
-                    ]
-                    memory_step.observations = "Execution logs:\n" + execution_logs
+                    execution_outputs_console = [Text(execution_logs)]
+                    memory_step.observations = execution_logs
                     self.logger.log(Group(*execution_outputs_console), level=LogLevel.INFO)
             error_msg = str(e)
             if "Import of " in error_msg and " is not allowed" in error_msg:
